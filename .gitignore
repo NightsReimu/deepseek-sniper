@@ -2,6 +2,9 @@
 server_key
 aliyun_deploy_key
 aliyun_deploy_key.pub
+aliyun_ai_key
+aliyun_ai_key.pub
+SSH_ACCESS.md
 config.json
 
 # 🕶 运行时数据
