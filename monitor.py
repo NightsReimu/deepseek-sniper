@@ -7,10 +7,13 @@ DeepSeek Chat 网站变更监测器
   - 部署版本号 (meta commit-id)
   - 页面标题 / 描述 / 关键词 等文案
   - JS 前端资源文件（新增/移除/文件名变化 = 新版本发布）
-  - JS 代码包内容（同名文件内容变化 = 代码更新）
-  - 页面可见文字
+  - JS 代码包内容（同名文件内容变化 = 代码更新，每轮全量哈希验证）
+  - HTML 初始响应中的文字（注：chat.deepseek.com 为 SPA，动态渲染的文字
+    需执行 JS 才能获取，本程序监测的是服务端返回的静态 HTML 内容；
+    如需监测渲染后文字请使用 Playwright/Chromium 方案）
 
 检测到变化后，将更新内容推送至飞书机器人。
+推送失败时变更会暂存 pending.json 并在下次运行自动补推，保证不漏报。
 
 配置（二选一）：
   1. 环境变量: FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
@@ -37,20 +40,20 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 TARGET_URL = "https://chat.deepseek.com/"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 STATE_FILE = BASE_DIR / "snapshot.json"
+PENDING_FILE = BASE_DIR / "pending.json"
 LOG_FILE = BASE_DIR / "monitor.log"
 LOCK_FILE = BASE_DIR / "monitor.lock"
 
 MAX_LOG_SIZE = 2 * 1024 * 1024   # 日志超过 2MB 自动截断
 MAX_MSG_LEN = 5000               # 飞书消息最大字符数（超出截断）
 MAX_TEXT_LEN = 20000             # 页面文字快照保存上限
-MAX_JS_FETCH = 3                 # 每次最多深度抓取多少个 JS 文件
-MAX_JS_BYTES = 5 * 1024 * 1024   # 单个 JS 文件读取上限
+MAX_JS_BYTES = 5 * 1024 * 1024   # 单个 JS 文件读取上限（超限视为异常，保留旧哈希）
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 动态变化的 meta（每次请求都不同，必须排除，否则会误报）
@@ -96,20 +99,40 @@ def load_state():
 
 
 def save_state(state):
-    STATE_FILE.write_text(
+    """原子写入状态文件：先写临时文件再 os.replace，
+    防止进程被杀/断电时 JSON 写一半导致状态损坏、基线丢失。"""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(STATE_FILE))
 
 
 def sha256_hex(data):
     return hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()
 
 
-def fetch(url, timeout=30, max_bytes=None):
-    """GET 请求，返回 (状态码, 最终URL, 文本内容)。"""
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read(max_bytes) if max_bytes else resp.read()
-        return resp.getcode(), resp.geturl(), body.decode("utf-8", errors="replace")
+def fetch(url, timeout=30, max_bytes=None, etag=None, last_modified=None):
+    """GET 请求，返回 (状态码, 最终URL, 文本内容, 响应ETag, Last-Modified)。
+
+    携带 If-None-Match / If-Modified-Since 时为条件请求：
+    内容未变时服务器返回 304（此时 body 为空），用于零流量验证 JS 是否更新。
+    """
+    headers = dict(HEADERS)
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(max_bytes) if max_bytes else resp.read()
+            return (resp.getcode(), resp.geturl(),
+                    body.decode("utf-8", errors="replace"),
+                    resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return 304, url, "", None, None
+        raise
 
 
 def get_webhook():
@@ -171,6 +194,7 @@ def extract_snapshot(html_text):
     assets = sorted(urljoin(TARGET_URL, u) for u in assets)
 
     # 可见文字（去掉 script/style 标签，保留句子结构）
+    # 注：这是 HTML 初始响应中的静态文字（SPA 动态渲染的文字需执行 JS 才能获取）
     text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html_text)
     text = re.sub(r"(?is)<[^>]+>", " ", text)
     text = html_mod.unescape(text)
@@ -191,36 +215,66 @@ def extract_snapshot(html_text):
 
 
 def is_valid_page(status, snapshot, raw_html):
-    """判断抓到的页面是否为真实页面（防止被验证码/挑战页/错误页干扰）。"""
+    """判断抓到的页面是否为真实 DeepSeek 页面（防止验证码/挑战页/错误页干扰）。
+
+    校验顺序：
+    1. 状态码与最小体积
+    2. 反爬挑战特征（Cloudflare / AWS WAF）
+    3. DeepSeek 品牌特征（保持宽松，避免改版时误判）
+    """
     if status != 200 or len(raw_html) < 500:
         return False
-    if not snapshot["commit_id"] and not snapshot["assets"] and not snapshot["title"]:
+    low = raw_html.lower()
+    if "just a moment" in low or "cf-challenge" in low or "awswaf" in low \
+            or "challenge.js" in low or "aws-waf-token" in low:
         return False
-    if "just a moment" in raw_html.lower() or "cf-challenge" in raw_html.lower():
-        return False
-    return True
+    has_marker = (
+        bool(snapshot["commit_id"])
+        or "deepseek" in snapshot["title"].lower()
+        or "fe-static.deepseek.com" in low
+        or ("<title>" in low and "deepseek" in low)
+    )
+    return has_marker
 
 
-def deep_hash_js(assets, prev_hashes):
-    """对 JS 资源做内容哈希：文件名已变的直接抓取；文件名没变的复用旧哈希（节省流量）。
-    返回 {url: sha256前12位}。"""
-    hashes = {}
-    fetched = 0
+def deep_hash_js(assets, prev_meta):
+    """对全部 JS 资源做内容哈希（每轮全量验证，保证同名文件内容变化也能检出）。
+
+    - 优先用 ETag / Last-Modified 条件请求：内容未变 → 304，零流量复用旧哈希
+    - 内容变化（200）或服务器不支持条件请求 → 全量下载重新计算哈希
+    - 抓取失败 → 保留旧哈希并记录，避免单次网络抖动引发假警报
+
+    返回 {url: {"hash": sha256前12位, "etag": ..., "last_modified": ...}}
+    """
+    result = {}
     for url in assets:
-        if not url.endswith(".js"):
-            continue
-        if fetched >= MAX_JS_FETCH:
-            break
-        if prev_hashes and url in prev_hashes:
-            hashes[url] = prev_hashes[url]  # 文件名未变，复用上次哈希
-            continue
+        path = urlparse(url).path
+        if not path.lower().endswith(".js"):
+            continue  # 含 query string 的 .js?v=xxx 也能正确识别
+        prev = prev_meta.get(url) or {}
+        if isinstance(prev, str):
+            prev = {"hash": prev}  # 兼容旧版状态文件（js_hashes 为 {url: "hash"} 格式）
         try:
-            _, _, body = fetch(url, timeout=60, max_bytes=MAX_JS_BYTES)
-            hashes[url] = sha256_hex(body)[:12]
-            fetched += 1
+            code, _, body, etag, lm = fetch(
+                url, timeout=60, max_bytes=MAX_JS_BYTES,
+                etag=prev.get("etag"), last_modified=prev.get("last_modified"))
+            if code == 304:
+                result[url] = {
+                    "hash": prev.get("hash", ""),
+                    "etag": etag or prev.get("etag", ""),
+                    "last_modified": lm or prev.get("last_modified", ""),
+                }
+                continue
+            result[url] = {
+                "hash": sha256_hex(body)[:12],
+                "etag": etag or "",
+                "last_modified": lm or "",
+            }
         except Exception as e:
             log("WARN JS 抓取失败 %s: %s" % (url, e))
-    return hashes
+            if prev:
+                result[url] = prev  # 保留旧哈希，本轮跳过该文件
+    return result
 
 
 # ---------------------------------------------------------------- 差异报告
@@ -290,15 +344,19 @@ def build_change_report(old, new, old_hashes, new_hashes):
         parts.append("\n".join(lines))
 
     # 4. 代码包内容变化（同名文件内容变了）
+    def _js_hash(m):
+        return m.get("hash") if isinstance(m, dict) else m
+
     changed_js = []
     for url in sorted(set(old_hashes) | set(new_hashes)):
-        if url in old_hashes and url in new_hashes and old_hashes[url] != new_hashes[url]:
+        if url in old_hashes and url in new_hashes \
+                and _js_hash(old_hashes[url]) != _js_hash(new_hashes[url]):
             changed_js.append(url)
     if changed_js:
         lines = ["**📦 代码包内容变化**"]
         for u in changed_js:
             lines.append("- ⚠️ `%s` 内容已更新（%s → %s）" % (
-                u.split("/")[-1], old_hashes.get(u, "?"), new_hashes.get(u, "?")))
+                u.split("/")[-1], _js_hash(old_hashes.get(u, "")), _js_hash(new_hashes.get(u, ""))))
         parts.append("\n".join(lines))
 
     # 5. 页面可见文字变化
@@ -392,12 +450,41 @@ def run():
 
 def do_run():
     state = load_state()
+
+    # ---- 优先补推未送达的变更（监测与消息投递解耦）
+    # 上一轮推送失败时，变更已暂存 pending.json；补推成功后才应用其基线，
+    # 保证「检测到的更新」永远不会因飞书临时故障而丢失。
+    if PENDING_FILE.exists():
+        try:
+            pending = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            log("WARN pending.json 损坏，删除后继续")
+            PENDING_FILE.unlink()
+            pending = None
+        if pending:
+            ok, _ = send_feishu("🚨 DeepSeek 网站检测到更新（补推）",
+                                pending["report"], template="red")
+            if not ok:
+                log("ERROR 补推失败，保留 pending.json，下次运行继续重试")
+                return
+            state = {
+                "baseline_hash": pending["baseline_hash"],
+                "snapshot": pending["snapshot"],
+                "js_hashes": pending["js_hashes"],
+                "consecutive_failures": 0,
+                "last_check": now_beijing(),
+                "last_status": "changed",
+            }
+            save_state(state)
+            PENDING_FILE.unlink()
+            log("OK 补推成功，已应用暂存变更的基线，继续正常检查")
+
     prev = state.get("snapshot") if state else None
     prev_hashes = (state.get("js_hashes") or {}) if state else {}
 
     # ---- 抓取
     try:
-        status, _, raw = fetch(TARGET_URL, timeout=30)
+        status, _, raw, _, _ = fetch(TARGET_URL, timeout=30)
     except urllib.error.HTTPError as e:
         status = e.code
         raw = ""
@@ -425,13 +512,15 @@ def do_run():
 
     # ---- 解析快照
     snap = extract_snapshot(raw)
+    # 每轮全量验证全部 JS 内容（ETag 条件请求省流量），js_hashes 集合恒定，
+    # snap_hash 不会因哈希集合数量变化而漂移
     js_hashes = deep_hash_js(snap["assets"], prev_hashes)
     snap_hash = sha256_hex(json.dumps({
         "title": snap["title"],
         "commit_id": snap["commit_id"],
         "metas": snap["metas"],
         "assets": snap["assets"],
-        "js_hashes": js_hashes,
+        "js_hashes": {u: v["hash"] for u, v in js_hashes.items()},
         "visible_text": snap["visible_text"],
     }, ensure_ascii=False, sort_keys=True))
 
@@ -448,7 +537,7 @@ def do_run():
         save_state(new_state)
         log("OK 基线已建立 (commit-id=%s, 资源=%d)" % (snap["commit_id"], len(snap["assets"])))
         # 发送启动确认（同时验证飞书通道）
-        summary = "**✅ DeepSeek 网站监测已启动**\n\n已抓取当前页面并建立基线，之后每 10 分钟自动检查一次。\n\n"
+        summary = "**✅ DeepSeek 网站监测已启动**\n\n已抓取当前页面并建立基线，之后每 3 分钟自动检查一次。\n\n"
         summary += "- 部署版本 (commit-id): `%s`\n" % (snap["commit_id"] or "无")
         summary += "- 前端资源: %d 个 JS/CSS 文件\n" % len(snap["assets"])
         summary += "- 页面标题: %s\n" % (snap["title"] or "无")
@@ -462,6 +551,9 @@ def do_run():
     if snap_hash == prev_hash:
         new_state = dict(state)
         new_state.update({
+            # 写回本轮 js_hashes（新格式，含 ETag 元数据）：
+            # 1) 完成旧格式迁移 2) 下一轮即可用 ETag 条件请求，零流量验证 JS
+            "js_hashes": js_hashes,
             "consecutive_failures": 0,
             "last_check": now_beijing(),
             "last_status": "ok",
@@ -477,6 +569,23 @@ def do_run():
         report = "页面发生变化，但未能提取出可读差异，请人工查看网站。"
 
     ok = push_update(report)
+    if not ok:
+        # 推送失败：绝不更新基线！变更暂存 pending.json，下次运行优先补推，
+        # 避免「飞书网络异常 → 基线已更新 → 更新永久丢失」的漏报。
+        pending = {
+            "report": report,
+            "snapshot": snap,
+            "js_hashes": js_hashes,
+            "baseline_hash": snap_hash,
+        }
+        tmp = PENDING_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pending, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(str(tmp), str(PENDING_FILE))
+        log("ERROR 飞书推送失败，变更已暂存 pending.json，保留旧基线待重试: %s"
+            % report.replace("\n", " ")[:200])
+        return
+
     new_state = {
         "baseline_hash": snap_hash,
         "snapshot": snap,
@@ -486,17 +595,17 @@ def do_run():
         "last_status": "changed",
     }
     save_state(new_state)
-    log("CHANGE 检测到变化，飞书推送%s: %s"
-        % ("成功" if ok else "失败", report.replace("\n", " ")[:200]))
+    log("CHANGE 检测到变化，飞书推送成功: %s" % report.replace("\n", " ")[:200])
 
 
 def main():
     if "--reset" in sys.argv:
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-            log("OK 已删除旧基线 %s，下次运行将重新建立基线" % STATE_FILE)
-        else:
-            log("INFO 无旧基线可删")
+        for f in (STATE_FILE, PENDING_FILE):
+            if f.exists():
+                f.unlink()
+                log("OK 已删除 %s，下次运行将重新建立基线" % f)
+            else:
+                log("INFO 无 %s 可删" % f.name)
         return
     run()
 
