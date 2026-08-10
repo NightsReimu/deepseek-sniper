@@ -153,5 +153,62 @@ class TestPendingRetry(unittest.TestCase):
                 self.assertEqual(s["baseline_hash"], monitor.load_state()["baseline_hash"])
 
 
+class TestStringExtract(unittest.TestCase):
+    """新版本具体内容：JS 字符串提取与新旧对比。"""
+
+    def test_extract_js_strings(self):
+        js = '''var a = "新增多模态能力";
+var b = 'DeepSeek-V4 正式发布，支持文件上传';
+var c = "The quick brown fox jumps over the lazy dog";
+var d = "a1b2c3d4e5f6a1b2c3d4e5f6";          // 纯哈希 → 过滤
+var e = "https://example.com/path";           // URL → 过滤
+var f = "ab";                                  // 过短 → 过滤
+var g = "getUserInfoList";                     // 无空格驼峰标识符 → 过滤
+var h = "\\u65b0\\u589e\\u6df1\\u5ea6\\u601d\\u8003\\u6a21\\u5f0f";  // \\u 转义中文
+var i = "12345";                               // 纯数字 → 过滤
+'''
+        strs = monitor.extract_js_strings(js)
+        joined = "\n".join(strs)
+        self.assertIn("新增多模态能力", joined)
+        self.assertIn("DeepSeek-V4 正式发布，支持文件上传", joined)
+        self.assertIn("The quick brown fox jumps over the lazy dog", joined)
+        self.assertIn("新增深度思考模式", joined)  # \uXXXX 已解码
+        for noise in ("a1b2c3d4e5f6a1b2c3d4e5f6", "https://example.com/path",
+                      "ab", "getUserInfoList", "12345"):
+            self.assertNotIn(noise, joined)
+
+    def test_dangling_quote_lexer(self):
+        """回归：minified JS 中悬空引号/模板字符串会导致正则错位，词法扫描必须免疫。
+
+        模板字符串内含未闭合的双引号 + 后面的真实字符串，必须全部正确识别。
+        """
+        js = (
+            "var tpl = `{name:\"downloadCodeFile\",message:\"中间被吞掉的文案\","
+            "payload:\"\"}}`;\n"
+            "tracker.info({name:\"downloadCodeFile\",message:\"下载代码文件\","
+            "payload:{infostring:t||\"\"}});\n"
+            "var a = \"新增多模态能力\";"
+        )
+        strs = monitor.extract_js_strings(js)
+        joined = "\n".join(strs)
+        self.assertIn("下载代码文件", joined)
+        self.assertIn("新增多模态能力", joined)
+        # 模板字符串内部的内容不应被错误提取为独立字符串
+        self.assertNotIn("中间被吞掉的文案", joined)
+
+    def test_build_string_diff_report(self):
+        old = {"旧版文案A", "共同文案", "旧功能说明"}
+        new = {"新版文案B", "共同文案", "新增的深度思考功能说明"}
+        report = monitor.build_string_diff_report(old, new)
+        self.assertIn("🧬", report)
+        self.assertIn("新版文案B", report)
+        self.assertIn("新增的深度思考功能说明", report)
+        self.assertIn("旧版文案A", report)
+        # 旧基线缺失 → 不生成对比报告
+        self.assertIsNone(monitor.build_string_diff_report(set(), new))
+        # 无变化 → 无报告
+        self.assertIsNone(monitor.build_string_diff_report({"x"}, {"x"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

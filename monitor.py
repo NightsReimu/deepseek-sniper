@@ -153,6 +153,127 @@ def get_webhook():
     return ""
 
 
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)
+URL_RE = re.compile(r"^(https?:)?//|^data:|^[\w-]+\.(com|net|cn|org|io|dev|ai)[/.]", re.I)
+UNICODE_ESC_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+# minified 代码里单引号字符字面量会导致字符串匹配错位，吞入代码片段；
+# 用代码特征关键字把这些"伪字符串"过滤掉
+CODE_FRAGMENT_RE = re.compile(
+    r"!==|===|=>|\.length|lastIndexOf|indexOf\(|\breturn\b|\btypeof\b|\bif\(|"
+    r"\.jsx|\bfunction\b|__DEV__|\bthrow\b|new Error|Object\.entries|"
+    r"\bconst\b|\blet\b|\bvar\b|\.prototype\b")
+
+
+def extract_js_strings(js_text, max_items=200, min_len=4, max_len=80):
+    """从 JS bundle 中提取可读字符串常量（中文文案/英文句子/版本号）。
+
+    用于展示"新版本具体内容"：对比新旧版本提取出的字符串集合，
+    新增的文案往往就是新功能/新提示，是比 commit-id 更直观的更新信号。
+
+    实现：轻量词法扫描而非正则——minified JS 中大量悬空引号
+    （模板字符串、HTML 内嵌等）会导致正则错位匹配、吞掉真实字符串；
+    逐字符扫描能严格按引号配对识别字符串字面量，模板字符串整体跳过。
+    """
+    found = set()
+    n = len(js_text)
+    cursor = 0
+
+    def process(s):
+        s = UNICODE_ESC_RE.sub(lambda x: chr(int(x.group(1), 16)), s)
+        s = s.replace("\\n", " ").replace("\\t", " ").replace("\\/", "/")
+        s = s.strip()
+        if not (min_len <= len(s) <= max_len):
+            return
+        if URL_RE.match(s) or HEX_RE.match(s) or s.isdigit():
+            return
+        if CODE_FRAGMENT_RE.search(s):
+            return  # 伪字符串：含代码特征
+        # 错位匹配的伪字符串几乎都以代码符号开头/结尾；真实文案以文字或数字开头
+        if not (s[0].isalnum() or CJK_RE.match(s[0])):
+            return
+        if not (s[-1].isalnum() or s[-1] in "。！？!?…."):
+            return
+        alnum = sum(c.isalnum() for c in s)
+        if alnum / max(len(s), 1) < 0.5:
+            return  # 符号占比过高，疑似代码
+        if not CJK_RE.search(s):
+            # 非中文：要求像英文句子（含空格或版本号），且字母占比高
+            letters = sum(c.isalpha() for c in s)
+            if letters < 6:
+                return
+            if not (re.search(r"\s", s) or re.search(r"\d+\.\d+", s)
+                    or re.search(r"\bv\d", s, re.I)):
+                return
+            if letters / max(len(s), 1) < 0.6:
+                return
+        found.add(s)
+
+    while True:
+        # 找下一个候选引号（" / ' / `），用 C 实现的 find 加速
+        i = n
+        for ch in ('"', "'", "`"):
+            pos = js_text.find(ch, cursor)
+            if pos != -1 and pos < i:
+                i = pos
+                ch_found = ch
+        if i >= n:
+            break
+        if ch_found == "`":
+            # 模板字符串：整体跳过，内部引号不参与匹配
+            j = i + 1
+            while j < n:
+                if js_text[j] == "\\":
+                    j += 2
+                elif js_text[j] == "`":
+                    break
+                else:
+                    j += 1
+            cursor = j + 1
+            continue
+        # 普通字符串字面量：配对扫描到结束引号
+        quote = ch_found
+        j = i + 1
+        buf = []
+        while j < n:
+            if js_text[j] == "\\":
+                buf.append(js_text[j:j + 2])
+                j += 2
+            elif js_text[j] == quote:
+                break
+            else:
+                buf.append(js_text[j])
+                j += 1
+        process("".join(buf))
+        cursor = j + 1
+        if len(found) > max_items * 3:
+            break  # 提前退出，避免超大 bundle 拖慢扫描
+    return sorted(found)[:max_items]
+
+
+def build_string_diff_report(old_set, new_set, max_items=15):
+    """对比新旧版本 JS 字符串集合，生成"新版本具体内容"摘要 markdown。
+
+    旧基线缺失（旧资源已下线）时返回 None，提示无法对比。
+    """
+    if not old_set:
+        return None
+    added = sorted(new_set - old_set, key=len, reverse=True)[:max_items]
+    removed = sorted(old_set - new_set, key=len, reverse=True)[:max_items]
+    if not added and not removed:
+        return None
+    lines = ["**🧬 新版本具体内容（提取自代码包）**"]
+    if added:
+        lines.append("**新增：**")
+        for s in added:
+            lines.append("- ➕ %s" % md_escape(s[:60]))
+    if removed:
+        lines.append("**移除：**")
+        for s in removed:
+            lines.append("- ➖ %s" % md_escape(s[:60]))
+    return "\n".join(lines)
+
+
 def md_escape(text):
     """转义 lark_md 中的特殊字符，避免排版错乱。"""
     text = text.replace("\\", "\\\\")
@@ -243,10 +364,13 @@ def deep_hash_js(assets, prev_meta):
     - 优先用 ETag / Last-Modified 条件请求：内容未变 → 304，零流量复用旧哈希
     - 内容变化（200）或服务器不支持条件请求 → 全量下载重新计算哈希
     - 抓取失败 → 保留旧哈希并记录，避免单次网络抖动引发假警报
+    - 返回 (hashes, bodies)：bodies 保存本轮实际下载的 JS 内容，
+      供"新版本具体内容"字符串提取使用（304 时无 body）
 
-    返回 {url: {"hash": sha256前12位, "etag": ..., "last_modified": ...}}
+    hashes 格式 {url: {"hash": sha256前12位, "etag": ..., "last_modified": ...}}
     """
     result = {}
+    bodies = {}
     for url in assets:
         path = urlparse(url).path
         if not path.lower().endswith(".js"):
@@ -270,11 +394,12 @@ def deep_hash_js(assets, prev_meta):
                 "etag": etag or "",
                 "last_modified": lm or "",
             }
+            bodies[url] = body
         except Exception as e:
             log("WARN JS 抓取失败 %s: %s" % (url, e))
             if prev:
                 result[url] = prev  # 保留旧哈希，本轮跳过该文件
-    return result
+    return result, bodies
 
 
 # ---------------------------------------------------------------- 差异报告
@@ -471,6 +596,7 @@ def do_run():
                 "baseline_hash": pending["baseline_hash"],
                 "snapshot": pending["snapshot"],
                 "js_hashes": pending["js_hashes"],
+                "js_strings": pending.get("js_strings") or {},
                 "consecutive_failures": 0,
                 "last_check": now_beijing(),
                 "last_status": "changed",
@@ -514,7 +640,7 @@ def do_run():
     snap = extract_snapshot(raw)
     # 每轮全量验证全部 JS 内容（ETag 条件请求省流量），js_hashes 集合恒定，
     # snap_hash 不会因哈希集合数量变化而漂移
-    js_hashes = deep_hash_js(snap["assets"], prev_hashes)
+    js_hashes, js_bodies = deep_hash_js(snap["assets"], prev_hashes)
     snap_hash = sha256_hex(json.dumps({
         "title": snap["title"],
         "commit_id": snap["commit_id"],
@@ -526,16 +652,22 @@ def do_run():
 
     # ---- 首次运行：建立基线
     if prev is None or state.get("baseline_hash") is None:
+        # 基线轮提取 JS 字符串并入库，作为下次变化的对比基准
+        js_strings = {url: extract_js_strings(body)
+                      for url, body in js_bodies.items()}
         new_state = {
             "baseline_hash": snap_hash,
             "snapshot": snap,
             "js_hashes": js_hashes,
+            "js_strings": js_strings,
             "consecutive_failures": 0,
             "last_check": now_beijing(),
             "last_status": "baseline",
         }
         save_state(new_state)
-        log("OK 基线已建立 (commit-id=%s, 资源=%d)" % (snap["commit_id"], len(snap["assets"])))
+        log("OK 基线已建立 (commit-id=%s, 资源=%d, 提取文案%d条)"
+            % (snap["commit_id"], len(snap["assets"]),
+               sum(len(v) for v in js_strings.values())))
         # 发送启动确认（同时验证飞书通道）
         summary = "**✅ DeepSeek 网站监测已启动**\n\n已抓取当前页面并建立基线，之后每 3 分钟自动检查一次。\n\n"
         summary += "- 部署版本 (commit-id): `%s`\n" % (snap["commit_id"] or "无")
@@ -568,6 +700,32 @@ def do_run():
         log("WARN 哈希变化但未生成差异报告")
         report = "页面发生变化，但未能提取出可读差异，请人工查看网站。"
 
+    # ---- 提取"新版本具体内容"：对比新旧 JS 中的字符串常量（文案/提示语/功能名）
+    stored_strings = state.get("js_strings") or {}
+    new_js_strings = dict(stored_strings)
+    for url, body in js_bodies.items():
+        new_js_strings[url] = extract_js_strings(body)
+    old_set = set()
+    for v in stored_strings.values():
+        old_set |= set(v)
+    # 已移除的旧 JS 可能还在 CDN 上，尝试下载提取旧版本字符串用于对比
+    removed_urls = [u for u in prev.get("assets", [])
+                    if u not in snap["assets"]
+                    and urlparse(u).path.lower().endswith(".js")]
+    for u in removed_urls:
+        new_js_strings.pop(u, None)
+        try:
+            _, _, body, _, _ = fetch(u, timeout=30, max_bytes=MAX_JS_BYTES)
+            old_set |= set(extract_js_strings(body))
+        except Exception:
+            pass  # 旧文件已下线，无法对比，忽略
+    new_set = set()
+    for v in new_js_strings.values():
+        new_set |= set(v)
+    string_report = build_string_diff_report(old_set, new_set)
+    if string_report:
+        report = report + "\n\n" + string_report
+
     ok = push_update(report)
     if not ok:
         # 推送失败：绝不更新基线！变更暂存 pending.json，下次运行优先补推，
@@ -576,6 +734,7 @@ def do_run():
             "report": report,
             "snapshot": snap,
             "js_hashes": js_hashes,
+            "js_strings": new_js_strings,
             "baseline_hash": snap_hash,
         }
         tmp = PENDING_FILE.with_suffix(".tmp")
@@ -590,6 +749,7 @@ def do_run():
         "baseline_hash": snap_hash,
         "snapshot": snap,
         "js_hashes": js_hashes,
+        "js_strings": new_js_strings,
         "consecutive_failures": 0,
         "last_check": now_beijing(),
         "last_status": "changed",
