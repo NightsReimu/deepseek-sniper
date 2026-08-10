@@ -1,0 +1,25 @@
+# 🔒 密钥与凭据（严禁提交）
+server_key
+aliyun_deploy_key
+aliyun_deploy_key.pub
+config.json
+
+# 🕶 运行时数据
+snapshot.json
+monitor.log
+cron.log
+monitor.lock
+
+# 🐍 Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 🖥 系统
+.DS_Store
+Thumbs.db
+
+# 📦 本地测试
+/tmp/

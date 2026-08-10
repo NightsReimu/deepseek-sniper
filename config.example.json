@@ -1,0 +1,4 @@
+{
+  "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/在此填入你的飞书机器人Webhook",
+  "target_url": "https://chat.deepseek.com/"
+}
