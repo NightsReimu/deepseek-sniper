@@ -54,6 +54,11 @@ MAX_LOG_SIZE = 2 * 1024 * 1024   # 日志超过 2MB 自动截断
 MAX_MSG_LEN = 5000               # 飞书消息最大字符数（超出截断）
 MAX_TEXT_LEN = 20000             # 页面文字快照保存上限
 MAX_JS_BYTES = 5 * 1024 * 1024   # 单个 JS 文件读取上限（超限视为异常，保留旧哈希）
+MAX_NEWS_KEEP = 100              # seen_news 最多保留条数
+
+# 官方新闻公告：Docusaurus 静态站，侧边栏 News 链接指向最新新闻 /news/newsYYMMDD
+NEWS_INDEX_URL = "https://api-docs.deepseek.com/news/"
+NEWS_LINK_RE = re.compile(r'href="(/news/news\d+[^"]*)"')
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 动态变化的 meta（每次请求都不同，必须排除，否则会误报）
@@ -499,6 +504,80 @@ def build_change_report(old, new, old_hashes, new_hashes):
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------- 官方新闻公告
+
+def fetch_news_index():
+    """抓取 DeepSeek 官方新闻索引页，返回新闻 URL 列表（按页面出现顺序去重）。"""
+    try:
+        status, _, raw, _, _ = fetch(NEWS_INDEX_URL, timeout=30)
+        if status != 200:
+            log("WARN 新闻索引页状态异常: HTTP %s" % status)
+            return []
+        urls = []
+        for m in NEWS_LINK_RE.finditer(raw):
+            u = urljoin(NEWS_INDEX_URL, m.group(1))
+            if u not in urls:
+                urls.append(u)
+        return urls
+    except Exception as e:
+        log("WARN 新闻索引抓取失败: %s" % e)
+        return []
+
+
+def fetch_news_article(url):
+    """抓取单篇新闻，返回 (标题, 正文摘要)。失败返回 ("", "")。"""
+    try:
+        status, _, raw, _, _ = fetch(url, timeout=30)
+        if status != 200:
+            return "", ""
+        h1 = re.search(r"<h1[^>]*>(.*?)</h1>", raw, re.S)
+        title = re.sub(r"<[^>]+>", " ", h1.group(1)) if h1 else ""
+        title = html_mod.unescape(re.sub(r"\s+", " ", title)).strip()
+        body = re.sub(r"(?is)<(script|style|nav|footer)[^>]*>.*?</\1>", " ", raw)
+        body = re.sub(r"(?is)<[^>]+>", " ", body)
+        body = html_mod.unescape(re.sub(r"\s+", " ", body)).strip()
+        return title, body[:400]
+    except Exception as e:
+        log("WARN 新闻页抓取失败 %s: %s" % (url, e))
+        return "", ""
+
+
+def check_news(seen):
+    """检查官方新闻公告，新公告推送飞书；推送失败保留待重试。
+
+    seen 结构: {url: {"title": str, "summary": str, "pushed": bool}}
+    返回更新后的 seen（已见集合只增，超出 MAX_NEWS_KEEP 时丢弃最旧的）。
+    """
+    if not seen:
+        # 首次部署：只记录现有新闻为已见，不推送历史（避免刷屏）
+        urls = fetch_news_index()
+        for u in urls:
+            seen[u] = {"title": "", "summary": "", "pushed": True}
+        log("OK 新闻公告基线已建立（%d 条已有公告记为已见）" % len(urls))
+        return seen
+
+    urls = fetch_news_index()
+    for u in urls:
+        entry = seen.get(u) or {}
+        if entry.get("pushed"):
+            continue  # 已推送过
+        title, summary = entry.get("title"), entry.get("summary")
+        if not title:
+            title, summary = fetch_news_article(u)
+            if not title:
+                seen[u] = {"title": "", "summary": "", "pushed": False}
+                continue
+        markdown = ("**%s**\n\n%s\n\n🔗 %s"
+                    % (md_escape(title), md_escape(summary) or "（无摘要）", u))
+        ok, _ = send_feishu("📢 DeepSeek 官方新公告", markdown, template="blue")
+        seen[u] = {"title": title, "summary": summary, "pushed": ok}
+        log("NEWS 新公告「%s」推送%s" % (title[:40], "成功 ✅" if ok else "失败，待重试"))
+    if len(seen) > MAX_NEWS_KEEP:
+        for k in list(seen)[:len(seen) - MAX_NEWS_KEEP]:
+            seen.pop(k, None)
+    return seen
+
+
 # ---------------------------------------------------------------- 飞书推送
 
 def send_feishu(title, markdown, template="blue"):
@@ -605,6 +684,11 @@ def do_run():
             PENDING_FILE.unlink()
             log("OK 补推成功，已应用暂存变更的基线，继续正常检查")
 
+    # ---- 检查官方新闻公告（独立于页面监测，出错不影响主流程）
+    if state is None:
+        state = {}  # 首次运行（无基线）时初始化
+    state["seen_news"] = check_news(state.get("seen_news") or {})
+
     prev = state.get("snapshot") if state else None
     prev_hashes = (state.get("js_hashes") or {}) if state else {}
 
@@ -660,6 +744,7 @@ def do_run():
             "snapshot": snap,
             "js_hashes": js_hashes,
             "js_strings": js_strings,
+            "seen_news": state.get("seen_news") or {},
             "consecutive_failures": 0,
             "last_check": now_beijing(),
             "last_status": "baseline",
@@ -750,6 +835,7 @@ def do_run():
         "snapshot": snap,
         "js_hashes": js_hashes,
         "js_strings": new_js_strings,
+        "seen_news": state.get("seen_news") or {},
         "consecutive_failures": 0,
         "last_check": now_beijing(),
         "last_status": "changed",

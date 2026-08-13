@@ -210,5 +210,45 @@ var i = "12345";                               // 纯数字 → 过滤
         self.assertIsNone(monitor.build_string_diff_report({"x"}, {"x"}))
 
 
+class TestNewsMonitor(unittest.TestCase):
+    """官方新闻公告监测：首次建基线不推送、新公告推送、失败重试。"""
+
+    def test_first_run_records_only(self):
+        seen = {}
+        with mock.patch.object(monitor, "fetch_news_index",
+                               return_value=["/news/news260424"]), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            seen = monitor.check_news(seen)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen["/news/news260424"]["pushed"])
+        m.assert_not_called()  # 首次运行不推送历史
+
+    def test_new_article_push_and_retry(self):
+        seen = {"/news/news260424": {"title": "旧新闻", "summary": "", "pushed": True}}
+        # 第 1 轮：出现新公告，推送失败 → 保留待重试
+        with mock.patch.object(monitor, "fetch_news_index",
+                               return_value=["/news/news260424", "/news/news260500"]), \
+                mock.patch.object(monitor, "fetch_news_article",
+                                  return_value=("DeepSeek V5 Release", "新版本发布！")), \
+                mock.patch.object(monitor, "send_feishu",
+                                  return_value=(False, "err")) as m:
+            seen = monitor.check_news(seen)
+        self.assertEqual(m.call_count, 1)
+        self.assertFalse(seen["/news/news260500"]["pushed"], "推送失败必须保留待重试")
+        # 第 2 轮：重试成功 → 标记已推送
+        with mock.patch.object(monitor, "fetch_news_index",
+                               return_value=["/news/news260424", "/news/news260500"]), \
+                mock.patch.object(monitor, "send_feishu",
+                                  return_value=(True, "ok")) as m:
+            seen = monitor.check_news(seen)
+        self.assertTrue(seen["/news/news260500"]["pushed"])
+        # 第 3 轮：无新公告 → 不再推送
+        with mock.patch.object(monitor, "fetch_news_index",
+                               return_value=["/news/news260424", "/news/news260500"]), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            seen = monitor.check_news(seen)
+        m.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

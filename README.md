@@ -43,6 +43,7 @@ DeepSeek 的前端页面自带「指纹」，我们利用这些特征精准识�
 | **前端资源** | JS/CSS 文件名（内容哈希命名） | `main.7863ea53ee.js` → `main.cd9b6ed73e.js` | 文件名变化 = 全新构建产物上线 |
 | **代码包内容** | JS 文件内容 SHA-256 | 同名文件哈希变化 | 文件名没变但代码改了，照样抓出来（**每轮全量哈希**，ETag 条件请求省流量） |
 | **🧬 新版本具体内容** | JS 中的文案/提示语/功能名 | 新增/移除的字符串 | 直接把新版本带来的功能文案列进推送，比 commit-id 直观得多 |
+| **📢 官方新闻公告** | `api-docs.deepseek.com/news/` | 新公告链接出现 | 模型发布、功能更新的官方公告实时推送（含标题+摘要+链接） |
 | **页面文字** | 渲染可见文本 | 句子级 diff | 展示「删了什么、加了什么」逐句对比 |
 
 ### 🧠 智能防误报
@@ -162,6 +163,8 @@ python3 tests/test_smoke.py
 | `test_extract_js_strings` | 文案提取：中文/英文/`\uXXXX` 转义正常，哈希/URL/代码片段被过滤 |
 | `test_dangling_quote_lexer` | **回归**：minified 悬空引号/模板字符串不干扰提取（词法扫描） |
 | `test_build_string_diff_report` | 新旧版本字符串 diff 报告生成 |
+| `test_first_run_records_only` | 公告监测首次运行只建基线、不推送历史 |
+| `test_new_article_push_and_retry` | 新公告推送 + 失败保留待重试 + 重试成功不再重推 |
 
 ## 🛠️ 技术栈
 
