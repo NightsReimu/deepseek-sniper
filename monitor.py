@@ -59,6 +59,17 @@ MAX_NEWS_KEEP = 100              # seen_news 最多保留条数
 # 官方新闻公告：Docusaurus 静态站，侧边栏 News 链接指向最新新闻 /news/newsYYMMDD
 NEWS_INDEX_URL = "https://api-docs.deepseek.com/news/"
 NEWS_LINK_RE = re.compile(r'href="(/news/news\d+[^"]*)"')
+
+# API 文档站监测：sitemap 页面结构变化 + 核心页面正文内容变化
+API_DOCS_BASE = "https://api-docs.deepseek.com/"
+API_DOCS_WATCH_PAGES = [
+    "",                          # 首页（API 总览）
+    "quick_start/pricing",       # 价格
+    "api/create-chat-completion",  # 核心 API 参考
+    "quick_start/rate_limit",    # 限流
+    "quick_start/token_usage",   # Token 用量
+    "guides/thinking_mode",      # 深度思考
+]
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 动态变化的 meta（每次请求都不同，必须排除，否则会误报）
@@ -578,6 +589,113 @@ def check_news(seen):
     return seen
 
 
+# ---------------------------------------------------------------- API 文档站
+
+def fetch_sitemap_urls():
+    """抓取 api-docs sitemap.xml，返回全部页面 URL 列表。失败返回 []。"""
+    try:
+        status, _, raw, _, _ = fetch(urljoin(API_DOCS_BASE, "sitemap.xml"), timeout=30)
+        if status != 200:
+            return []
+        return re.findall(r"<loc>([^<]+)</loc>", raw)
+    except Exception as e:
+        log("WARN sitemap 抓取失败: %s" % e)
+        return []
+
+
+def fetch_doc_page_text(url):
+    """抓取文档页正文纯文本（Docusaurus SSR 的 <article> 区域）。失败返回 ""。"""
+    try:
+        status, _, raw, _, _ = fetch(url, timeout=30)
+        if status != 200:
+            return ""
+        m = re.search(r"(?is)<article[^>]*>(.*?)</article>", raw)
+        body = m.group(1) if m else raw
+        body = re.sub(r"(?is)<(script|style|nav)[^>]*>.*?</\1>", " ", body)
+        body = re.sub(r"(?is)<[^>]+>", " ", body)
+        return html_mod.unescape(re.sub(r"\s+", " ", body)).strip()
+    except Exception as e:
+        log("WARN 文档页抓取失败 %s: %s" % (url, e))
+        return ""
+
+
+def doc_text_diff(old_text, new_text, max_items=8):
+    """文档正文句子级 diff，返回 (removed, added)。"""
+    old_sents = split_sentences(old_text)
+    new_sents = split_sentences(new_text)
+    sm = difflib.SequenceMatcher(None, old_sents, new_sents, autojunk=False)
+    removed, added = [], []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("replace", "delete"):
+            removed.extend(old_sents[i1:i2])
+        if tag in ("replace", "insert"):
+            added.extend(new_sents[j1:j2])
+    return (removed[:max_items], added[:max_items],
+            len(removed) > max_items or len(added) > max_items)
+
+
+def check_api_docs(api_state):
+    """监测 API 文档站：
+    1. sitemap 页面结构变化（新增/移除文档页，含新新闻页）
+    2. 核心页面正文内容变化（句子级 diff 推送）
+    推送失败不更新基线，下次运行自动重试。首次运行只建立基线。
+
+    api_state 结构: {"sitemap": [url], "pages": {url: {"hash": str, "text": str}}}
+    返回更新后的 api_state。
+    """
+    if not api_state:
+        api_state = {"sitemap": [], "pages": {}}
+
+    # ---- 1. 页面结构变化
+    urls = fetch_sitemap_urls()
+    if urls:
+        prev_urls = set(api_state.get("sitemap") or [])
+        cur_urls = set(urls)
+        if prev_urls:
+            added = sorted(cur_urls - prev_urls)
+            removed = sorted(prev_urls - cur_urls)
+            for u in added:
+                if "/news/" in u:
+                    title, summary = fetch_news_article(u)
+                    markdown = ("**%s**\n\n%s\n\n🔗 %s"
+                                % (md_escape(title) or u, md_escape(summary) or "（无摘要）", u))
+                else:
+                    markdown = "📄 **新增文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
+                ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="blue")
+                log("APIDOCS 新增页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
+            for u in removed:
+                markdown = "🗑 **移除文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
+                ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="orange")
+                log("APIDOCS 移除页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
+        api_state["sitemap"] = urls  # 推送失败也更新（页面结构变化是事实，避免重复刷屏）
+
+    # ---- 2. 核心页面正文变化
+    pages = api_state.setdefault("pages", {})
+    for rel in API_DOCS_WATCH_PAGES:
+        url = urljoin(API_DOCS_BASE, rel)
+        text = fetch_doc_page_text(url)
+        if not text:
+            continue  # 抓取失败跳过，保留旧基线
+        h = sha256_hex(text)
+        prev = pages.get(url)
+        if prev and prev.get("hash") != h:
+            removed, added, truncated = doc_text_diff(prev.get("text", ""), text)
+            lines = ["**%s**" % md_escape(url.replace(API_DOCS_BASE, "/"))]
+            for s in removed:
+                lines.append("- 旧: %s" % md_escape(s[:80]))
+            for s in added:
+                lines.append("+ 新: %s" % md_escape(s[:80]))
+            if truncated:
+                lines.append("…（差异较大，已截断）")
+            ok, _ = send_feishu("📝 API 文档内容更新", "\n".join(lines), template="blue")
+            log("APIDOCS 内容变化 %s 推送%s" % (url, "成功 ✅" if ok else "失败，待重试"))
+            if ok:
+                pages[url] = {"hash": h, "text": text}  # 推送成功才更新基线
+        elif prev is None:
+            pages[url] = {"hash": h, "text": text}  # 首次记录
+    return api_state
+
+
 # ---------------------------------------------------------------- 飞书推送
 
 def send_feishu(title, markdown, template="blue"):
@@ -688,6 +806,8 @@ def do_run():
     if state is None:
         state = {}  # 首次运行（无基线）时初始化
     state["seen_news"] = check_news(state.get("seen_news") or {})
+    # ---- 检查 API 文档站（sitemap 页面结构 + 核心页面正文）
+    state["api_docs"] = check_api_docs(state.get("api_docs") or {})
 
     prev = state.get("snapshot") if state else None
     prev_hashes = (state.get("js_hashes") or {}) if state else {}
@@ -745,6 +865,7 @@ def do_run():
             "js_hashes": js_hashes,
             "js_strings": js_strings,
             "seen_news": state.get("seen_news") or {},
+            "api_docs": state.get("api_docs") or {},
             "consecutive_failures": 0,
             "last_check": now_beijing(),
             "last_status": "baseline",
@@ -836,6 +957,7 @@ def do_run():
         "js_hashes": js_hashes,
         "js_strings": new_js_strings,
         "seen_news": state.get("seen_news") or {},
+        "api_docs": state.get("api_docs") or {},
         "consecutive_failures": 0,
         "last_check": now_beijing(),
         "last_status": "changed",

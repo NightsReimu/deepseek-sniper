@@ -250,5 +250,71 @@ class TestNewsMonitor(unittest.TestCase):
         m.assert_not_called()
 
 
+class TestApiDocsMonitor(unittest.TestCase):
+    """API 文档站监测：首次建基线、新页面、内容变化、失败重试。"""
+
+    SITEMAP = [
+        "https://api-docs.deepseek.com/",
+        "https://api-docs.deepseek.com/quick_start/pricing",
+        "https://api-docs.deepseek.com/api/create-chat-completion",
+    ]
+
+    def test_first_run_records_only(self):
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  return_value="文档正文内容"), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            st = monitor.check_api_docs({})
+        self.assertEqual(len(st["sitemap"]), 3)
+        self.assertEqual(len(st["pages"]), len(monitor.API_DOCS_WATCH_PAGES))
+        m.assert_not_called()  # 首次不推送
+
+    def test_new_page_and_content_change(self):
+        # 首次建基线
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value="旧版正文"), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            st = monitor.check_api_docs({})
+        m.assert_not_called()
+        # 第 2 轮：出现新页面 + 首页正文变化 → 推送
+        sitemap2 = self.SITEMAP + ["https://api-docs.deepseek.com/guides/new_feature"]
+        texts = {
+            "https://api-docs.deepseek.com/": "新版正文内容",
+            "https://api-docs.deepseek.com/quick_start/pricing": "旧版正文",
+            "https://api-docs.deepseek.com/api/create-chat-completion": "旧版正文",
+            "https://api-docs.deepseek.com/guides/new_feature": "新指南",
+        }
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=sitemap2), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: texts.get(u, "")), \
+                mock.patch.object(monitor, "send_feishu", return_value=(True, "ok")) as m:
+            st = monitor.check_api_docs(st)
+        # 新增页面 1 条 + 内容变化 1 条
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
+                         monitor.sha256_hex("新版正文内容"))
+
+    def test_content_change_retry(self):
+        # 建基线后正文变化，推送失败 → 基线不更新 → 下轮重推
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value="旧版正文"), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            st = monitor.check_api_docs({})
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value="新版正文"), \
+                mock.patch.object(monitor, "send_feishu", return_value=(False, "err")) as m:
+            st = monitor.check_api_docs(st)
+        # 推送失败 → 首页哈希不更新
+        self.assertNotEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
+                            monitor.sha256_hex("新版正文"))
+        # 下轮恢复 → 重推成功 → 哈希更新
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value="新版正文"), \
+                mock.patch.object(monitor, "send_feishu", return_value=(True, "ok")) as m:
+            st = monitor.check_api_docs(st)
+        self.assertEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
+                         monitor.sha256_hex("新版正文"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
