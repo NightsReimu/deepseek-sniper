@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -62,14 +63,17 @@ NEWS_LINK_RE = re.compile(r'href="(/news/news\d+[^"]*)"')
 
 # API 文档站监测：sitemap 页面结构变化 + 核心页面正文内容变化
 API_DOCS_BASE = "https://api-docs.deepseek.com/"
+# (相对路径, 页面身份标识) —— 标识必须出现在正文中，用于识别 CDN 错缓存返回的错误页面
 API_DOCS_WATCH_PAGES = [
-    "",                          # 首页（API 总览）
-    "quick_start/pricing",       # 价格
-    "api/create-chat-completion",  # 核心 API 参考
-    "quick_start/rate_limit",    # 限流
-    "quick_start/token_usage",   # Token 用量
-    "guides/thinking_mode",      # 深度思考
+    ("", "Your First API Call"),                  # 首页（API 总览）
+    ("quick_start/pricing", "Models & Pricing"),  # 价格
+    ("api/create-chat-completion", "Chat Completions API"),  # 核心 API 参考
+    ("quick_start/rate_limit", "Rate Limit"),     # 限流
+    ("quick_start/token_usage", "Token"),         # Token 用量
+    ("guides/thinking_mode", "Thinking Mode"),    # 深度思考
 ]
+# 内容变化二次确认间隔（秒）：两次抓取结果一致才推送，防止 CDN 抖动/错缓存误报
+DOC_CHANGE_CONFIRM_DELAY = 3
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 动态变化的 meta（每次请求都不同，必须排除，否则会误报）
@@ -638,7 +642,12 @@ def check_api_docs(api_state):
     """监测 API 文档站：
     1. sitemap 页面结构变化（新增/移除文档页，含新新闻页）
     2. 核心页面正文内容变化（句子级 diff 推送）
-    推送失败不更新基线，下次运行自动重试。首次运行只建立基线。
+
+    抗误报措施：
+    - 页面身份校验：正文必须含预期标识，否则判为错缓存/异常页，跳过
+    - 二次确认：内容变化后间隔 DOC_CHANGE_CONFIRM_DELAY 秒重抓，两次一致才推送
+    - sitemap 变化同样二次确认，避免 CDN 抖动导致页面"消失"误报
+    - 推送失败不更新基线，下次运行自动重试；首次运行只建基线
 
     api_state 结构: {"sitemap": [url], "pages": {url: {"hash": str, "text": str}}}
     返回更新后的 api_state。
@@ -646,53 +655,73 @@ def check_api_docs(api_state):
     if not api_state:
         api_state = {"sitemap": [], "pages": {}}
 
-    # ---- 1. 页面结构变化
+    # ---- 1. 页面结构变化（二次确认）
     urls = fetch_sitemap_urls()
     if urls:
         prev_urls = set(api_state.get("sitemap") or [])
         cur_urls = set(urls)
-        if prev_urls:
-            added = sorted(cur_urls - prev_urls)
-            removed = sorted(prev_urls - cur_urls)
-            for u in added:
-                if "/news/" in u:
-                    title, summary = fetch_news_article(u)
-                    markdown = ("**%s**\n\n%s\n\n🔗 %s"
-                                % (md_escape(title) or u, md_escape(summary) or "（无摘要）", u))
-                else:
-                    markdown = "📄 **新增文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
-                ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="blue")
-                log("APIDOCS 新增页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
-            for u in removed:
-                markdown = "🗑 **移除文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
-                ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="orange")
-                log("APIDOCS 移除页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
-        api_state["sitemap"] = urls  # 推送失败也更新（页面结构变化是事实，避免重复刷屏）
+        if prev_urls and prev_urls != cur_urls:
+            if DOC_CHANGE_CONFIRM_DELAY:
+                time.sleep(DOC_CHANGE_CONFIRM_DELAY)
+            confirm = set(fetch_sitemap_urls())
+            if confirm != cur_urls:
+                log("WARN sitemap 两次抓取不一致（疑似 CDN 抖动），跳过本轮结构比对")
+            else:
+                added = sorted(cur_urls - prev_urls)
+                removed = sorted(prev_urls - cur_urls)
+                for u in added:
+                    if "/news/" in u:
+                        title, summary = fetch_news_article(u)
+                        markdown = ("**%s**\n\n%s\n\n🔗 %s"
+                                    % (md_escape(title) or u, md_escape(summary) or "（无摘要）", u))
+                    else:
+                        markdown = "📄 **新增文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
+                    ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="blue")
+                    log("APIDOCS 新增页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
+                for u in removed:
+                    markdown = "🗑 **移除文档页面：** `%s`" % u.replace(API_DOCS_BASE, "/")
+                    ok, _ = send_feishu("📄 DeepSeek API 文档更新", markdown, template="orange")
+                    log("APIDOCS 移除页面 %s 推送%s" % (u, "成功 ✅" if ok else "失败，待重试"))
+        api_state["sitemap"] = urls
 
-    # ---- 2. 核心页面正文变化
+    # ---- 2. 核心页面正文变化（身份校验 + 二次确认）
     pages = api_state.setdefault("pages", {})
-    for rel in API_DOCS_WATCH_PAGES:
+    for rel, marker in API_DOCS_WATCH_PAGES:
         url = urljoin(API_DOCS_BASE, rel)
         text = fetch_doc_page_text(url)
         if not text:
             continue  # 抓取失败跳过，保留旧基线
+        if marker not in text:
+            log("WARN 文档页内容异常（缺少标识「%s」，疑似错缓存），跳过: %s" % (marker, url))
+            continue
         h = sha256_hex(text)
         prev = pages.get(url)
-        if prev and prev.get("hash") != h:
-            removed, added, truncated = doc_text_diff(prev.get("text", ""), text)
-            lines = ["**%s**" % md_escape(url.replace(API_DOCS_BASE, "/"))]
-            for s in removed:
-                lines.append("- 旧: %s" % md_escape(s[:80]))
-            for s in added:
-                lines.append("+ 新: %s" % md_escape(s[:80]))
-            if truncated:
-                lines.append("…（差异较大，已截断）")
-            ok, _ = send_feishu("📝 API 文档内容更新", "\n".join(lines), template="blue")
-            log("APIDOCS 内容变化 %s 推送%s" % (url, "成功 ✅" if ok else "失败，待重试"))
-            if ok:
-                pages[url] = {"hash": h, "text": text}  # 推送成功才更新基线
-        elif prev is None:
+        if prev is None:
             pages[url] = {"hash": h, "text": text}  # 首次记录
+            continue
+        if prev.get("hash") == h:
+            continue  # 无变化
+
+        # 内容变化 → 二次确认，排除 CDN 抖动/错缓存
+        if DOC_CHANGE_CONFIRM_DELAY:
+            time.sleep(DOC_CHANGE_CONFIRM_DELAY)
+        text2 = fetch_doc_page_text(url)
+        if marker not in (text2 or "") or sha256_hex(text2) != h:
+            log("WARN 文档页内容抖动（两次抓取不一致，疑似 CDN 错缓存），跳过: %s" % url)
+            continue
+
+        removed, added, truncated = doc_text_diff(prev.get("text", ""), text)
+        lines = ["**%s**" % md_escape(url.replace(API_DOCS_BASE, "/"))]
+        for s in removed:
+            lines.append("- 旧: %s" % md_escape(s[:80]))
+        for s in added:
+            lines.append("+ 新: %s" % md_escape(s[:80]))
+        if truncated:
+            lines.append("…（差异较大，已截断）")
+        ok, _ = send_feishu("📝 API 文档内容更新", "\n".join(lines), template="blue")
+        log("APIDOCS 内容变化 %s 推送%s" % (url, "成功 ✅" if ok else "失败，待重试"))
+        if ok:
+            pages[url] = {"hash": h, "text": text}  # 推送成功才更新基线
     return api_state
 
 

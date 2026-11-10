@@ -251,7 +251,7 @@ class TestNewsMonitor(unittest.TestCase):
 
 
 class TestApiDocsMonitor(unittest.TestCase):
-    """API 文档站监测：首次建基线、新页面、内容变化、失败重试。"""
+    """API 文档站监测：首次建基线、新页面、内容变化、失败重试、抖动不误报。"""
 
     SITEMAP = [
         "https://api-docs.deepseek.com/",
@@ -259,61 +259,138 @@ class TestApiDocsMonitor(unittest.TestCase):
         "https://api-docs.deepseek.com/api/create-chat-completion",
     ]
 
+    @staticmethod
+    def _text(url, body):
+        """构造带页面身份标识的正文，模拟真实文档页。"""
+        marker = dict(monitor.API_DOCS_WATCH_PAGES).get(
+            url.replace(monitor.API_DOCS_BASE, "").rstrip("/"), "")
+        return "%s %s" % (marker, body)
+
     def test_first_run_records_only(self):
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
                 mock.patch.object(monitor, "fetch_doc_page_text",
-                                  return_value="文档正文内容"), \
+                                  side_effect=lambda u: self._text(u, "文档正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
                 mock.patch.object(monitor, "send_feishu") as m:
             st = monitor.check_api_docs({})
         self.assertEqual(len(st["sitemap"]), 3)
         self.assertEqual(len(st["pages"]), len(monitor.API_DOCS_WATCH_PAGES))
         m.assert_not_called()  # 首次不推送
 
-    def test_new_page_and_content_change(self):
-        # 首次建基线
+    def test_no_push_on_stable_content(self):
+        """内容稳定时反复运行不得推送（本轮误报问题的直接回归）。"""
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
-                mock.patch.object(monitor, "fetch_doc_page_text", return_value="旧版正文"), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: self._text(u, "稳定正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
                 mock.patch.object(monitor, "send_feishu") as m:
             st = monitor.check_api_docs({})
+            for _ in range(5):
+                st = monitor.check_api_docs(st)
         m.assert_not_called()
-        # 第 2 轮：出现新页面 + 首页正文变化 → 推送
+
+    def test_flapping_content_no_push(self):
+        """CDN 抖动：两次抓取内容不一致，必须不推送、不改基线。"""
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: self._text(u, "稳定正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu"):
+            st = monitor.check_api_docs({})
+        base_hash = st["pages"]["https://api-docs.deepseek.com/"]["hash"]
+
+        # 第一次抓取拿到「异常内容」，二次确认又变回原内容 → 判为抖动，跳过
+        calls = {"n": 0}
+
+        def flaky(u):
+            if u != "https://api-docs.deepseek.com/":
+                return self._text(u, "稳定正文")
+            calls["n"] += 1
+            return self._text(u, "异常内容" if calls["n"] == 1 else "稳定正文")
+
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", side_effect=flaky), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            st = monitor.check_api_docs(st)
+        m.assert_not_called()
+        self.assertEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"], base_hash)
+
+    def test_page_identity_guard(self):
+        """错缓存返回别的页面（缺标识）必须跳过，不当作变化。"""
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: self._text(u, "正常正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu"):
+            st = monitor.check_api_docs({})
+        base_hash = st["pages"]["https://api-docs.deepseek.com/quick_start/pricing"]["hash"]
+
+        # 价格页返回首页内容（无 Models & Pricing 标识）
+        def wrong_page(u):
+            if "pricing" in u:
+                return "Your First API Call 首页内容"
+            return self._text(u, "正常正文")
+
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text", side_effect=wrong_page), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu") as m:
+            st = monitor.check_api_docs(st)
+        m.assert_not_called()
+        self.assertEqual(
+            st["pages"]["https://api-docs.deepseek.com/quick_start/pricing"]["hash"], base_hash)
+
+    def test_new_page_and_content_change(self):
+        with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: self._text(u, "旧版正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu"):
+            st = monitor.check_api_docs({})
+
         sitemap2 = self.SITEMAP + ["https://api-docs.deepseek.com/guides/new_feature"]
         texts = {
-            "https://api-docs.deepseek.com/": "新版正文内容",
-            "https://api-docs.deepseek.com/quick_start/pricing": "旧版正文",
-            "https://api-docs.deepseek.com/api/create-chat-completion": "旧版正文",
+            "https://api-docs.deepseek.com/": self._text(
+                "https://api-docs.deepseek.com/", "新版正文内容"),
             "https://api-docs.deepseek.com/guides/new_feature": "新指南",
         }
+
+        def by_url(u):
+            return texts.get(u) or self._text(u, "旧版正文")
+
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=sitemap2), \
-                mock.patch.object(monitor, "fetch_doc_page_text",
-                                  side_effect=lambda u: texts.get(u, "")), \
+                mock.patch.object(monitor, "fetch_doc_page_text", side_effect=by_url), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
                 mock.patch.object(monitor, "send_feishu", return_value=(True, "ok")) as m:
             st = monitor.check_api_docs(st)
         # 新增页面 1 条 + 内容变化 1 条
         self.assertEqual(m.call_count, 2)
         self.assertEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
-                         monitor.sha256_hex("新版正文内容"))
+                         monitor.sha256_hex(texts["https://api-docs.deepseek.com/"]))
 
     def test_content_change_retry(self):
-        # 建基线后正文变化，推送失败 → 基线不更新 → 下轮重推
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
-                mock.patch.object(monitor, "fetch_doc_page_text", return_value="旧版正文"), \
-                mock.patch.object(monitor, "send_feishu") as m:
+                mock.patch.object(monitor, "fetch_doc_page_text",
+                                  side_effect=lambda u: self._text(u, "旧版正文")), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu"):
             st = monitor.check_api_docs({})
+        new_text = self._text("https://api-docs.deepseek.com/", "新版正文")
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
-                mock.patch.object(monitor, "fetch_doc_page_text", return_value="新版正文"), \
-                mock.patch.object(monitor, "send_feishu", return_value=(False, "err")) as m:
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value=new_text), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu", return_value=(False, "err")):
             st = monitor.check_api_docs(st)
-        # 推送失败 → 首页哈希不更新
         self.assertNotEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
-                            monitor.sha256_hex("新版正文"))
-        # 下轮恢复 → 重推成功 → 哈希更新
+                            monitor.sha256_hex(new_text))
         with mock.patch.object(monitor, "fetch_sitemap_urls", return_value=self.SITEMAP), \
-                mock.patch.object(monitor, "fetch_doc_page_text", return_value="新版正文"), \
-                mock.patch.object(monitor, "send_feishu", return_value=(True, "ok")) as m:
+                mock.patch.object(monitor, "fetch_doc_page_text", return_value=new_text), \
+                mock.patch.object(monitor, "DOC_CHANGE_CONFIRM_DELAY", 0), \
+                mock.patch.object(monitor, "send_feishu", return_value=(True, "ok")):
             st = monitor.check_api_docs(st)
         self.assertEqual(st["pages"]["https://api-docs.deepseek.com/"]["hash"],
-                         monitor.sha256_hex("新版正文"))
+                         monitor.sha256_hex(new_text))
 
 
 if __name__ == "__main__":

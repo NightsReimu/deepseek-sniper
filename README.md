@@ -166,6 +166,11 @@ python3 tests/test_smoke.py
 | `test_build_string_diff_report` | 新旧版本字符串 diff 报告生成 |
 | `test_first_run_records_only` | 公告监测首次运行只建基线、不推送历史 |
 | `test_new_article_push_and_retry` | 新公告推送 + 失败保留待重试 + 重试成功不再重推 |
+| `test_no_push_on_stable_content` | 文档内容稳定时反复运行不推送（CDN 抖动误报回归） |
+| `test_flapping_content_no_push` | 两次抓取内容不一致判为抖动，不推送、不改基线 |
+| `test_page_identity_guard` | 错缓存返回错误页面（缺身份标识）时跳过，不当作变化 |
+| `test_new_page_and_content_change` | sitemap 新页面 + 正文变化各推送一次 |
+| `test_content_change_retry` | 文档内容变化推送失败保留基线，下轮重试成功 |
 
 ## 🛠️ 技术栈
 
